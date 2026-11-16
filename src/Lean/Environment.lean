@@ -2714,6 +2714,152 @@ private def resolveImportedEntry (find? : Name → Option ConstantInfo)
   return some (winner, i₀)
 
 /--
+The declarations of an `ImportState`'s modules: `byName` gives each declared name its declarations
+with their modules, in module order, and `shared` lists the names two or more modules declare.
+Intended for use in `shake` only.
+-/
+structure ImportState.Declarations where
+  byName : Std.HashMap Name (Array (Name × ConstantInfo))
+  shared : Array Name
+
+/-- The declarations of `self`'s modules. Intended for use in `shake` only. -/
+def ImportState.declarations (self : ImportState) : ImportState.Declarations := Id.run do
+  let mut byName : Std.HashMap Name (Array (Name × ConstantInfo)) := {}
+  for mod in self.moduleNames do
+    let some data := self.moduleNameMap[mod]?.bind (·.mainModule?) | continue
+    for ci in data.constants do
+      byName := byName.alter ci.name fun ds? => some ((ds?.getD #[]).push (mod, ci))
+  let shared := byName.fold (init := #[]) fun ns n ds => if ds.size ≥ 2 then ns.push n else ns
+  return { byName, shared }
+
+/--
+The names that two or more of the modules `keep` admits declare in a way `finalizeImport` refuses,
+when those modules alone are loaded together: a name whose declarations, in module order, fall
+into two compatibility classes or more, a declaration joining the class of the first earlier one
+that subsumes it or that it subsumes. Unlike `checkImportConflicts`, it exempts no pair of modules
+that a direct import already loaded together, so it can list a name `finalizeImport` accepts, never
+the reverse. Intended for use in `shake` only.
+-/
+def ImportState.Declarations.conflicts (self : ImportState.Declarations) (keep : Name → Bool) :
+    Array Name := Id.run do
+  let find? (n : Name) : Option ConstantInfo :=
+    self.byName[n]?.bind fun ds => (ds.find? (keep ·.1)).map (·.2)
+  let mut conflicts := #[]
+  for n in self.shared do
+    let ds := (self.byName[n]?.getD #[]).filter (keep ·.1)
+    if ds.size < 2 then continue
+    -- one declaration standing for each class: as in `finalizeImport`, a declaration subsuming it
+    -- takes its place
+    let mut reps : Array ConstantInfo := #[]
+    for (_, ci) in ds do
+      match reps.findIdx? fun r => subsumesInfo find? ci r || subsumesInfo find? r ci with
+      | some k =>
+        if subsumesInfo find? ci reps[k]! then
+          reps := reps.set! k ci
+      | none =>
+        reps := reps.push ci
+    if reps.size > 1 then
+      conflicts := conflicts.push n
+  return conflicts
+
+/-- The modules `root` imports, transitively, `root` included. Intended for use in `shake` only. -/
+def ImportState.importClosure (self : ImportState) (root : Name) : Std.HashSet Name := Id.run do
+  -- `moduleNames` lists each module after the modules it imports, so one pass from its end reaches
+  -- every import of a module already reached.
+  let mut closure : Std.HashSet Name := ({} : Std.HashSet Name).insert root
+  for mod in self.moduleNames.reverse do
+    if closure.contains mod then
+      for imp in ((self.moduleNameMap[mod]?.bind (·.mainModule?)).map (·.imports)).getD #[] do
+        closure := closure.insert imp.module
+  return closure
+
+/-- `self` with only the modules in `keep`, in module order. Intended for use in `shake` only. -/
+def ImportState.restrict (self : ImportState) (keep : Std.HashSet Name) : ImportState :=
+  { self with moduleNames := self.moduleNames.filter keep.contains }
+
+/-- `n` with the prefix `main` replaced by `new`, if `n` is one of the names `owned`. -/
+private def mainUnder (owned : Std.HashSet Name) (new n : Name) : Name :=
+  if owned.contains n then n.replacePrefix `main new else n
+
+/--
+`e` with the names `owned` renamed by `mainUnder owned new` wherever it names a declaration: in its
+constants and in its projections' structure names.
+-/
+private partial def Expr.renameMain (owned : Std.HashSet Name) (new : Name) (e : Expr) : Expr :=
+  e.replace fun
+    | .const n ls => if owned.contains n then some (.const (mainUnder owned new n) ls) else none
+    | .proj s i b =>
+      if owned.contains s then some (.proj (mainUnder owned new s) i (b.renameMain owned new))
+      else none
+    | _ => none
+
+/--
+`ci` with the names `owned` (`main` and names under it) renamed by `mainUnder owned new`, in its own
+name, the names its declaration group lists, and every name its type, value and recursor rules
+refer to.
+-/
+private def ConstantInfo.renameMain (owned : Std.HashSet Name) (new : Name) (ci : ConstantInfo) :
+    ConstantInfo :=
+  let r := mainUnder owned new
+  let f (e : Expr) : Expr := e.renameMain owned new
+  let name := r ci.name
+  match ci with
+  | .axiomInfo v => .axiomInfo { v with name, type := f v.type }
+  | .defnInfo v => .defnInfo { v with name, type := f v.type, value := f v.value, all := v.all.map r }
+  | .thmInfo v => .thmInfo { v with name, type := f v.type, value := f v.value, all := v.all.map r }
+  | .opaqueInfo v =>
+    .opaqueInfo { v with name, type := f v.type, value := f v.value, all := v.all.map r }
+  | .quotInfo v => .quotInfo { v with name, type := f v.type }
+  | .inductInfo v =>
+    .inductInfo { v with name, type := f v.type, all := v.all.map r, ctors := v.ctors.map r }
+  | .ctorInfo v => .ctorInfo { v with name, type := f v.type, induct := r v.induct }
+  | .recInfo v =>
+    .recInfo { v with
+      name, type := f v.type, all := v.all.map r
+      rules := v.rules.map fun rule => { rule with ctor := r rule.ctor, rhs := f rule.rhs } }
+
+/-- `data` with the names `owned` renamed by `mainUnder owned new`, its prefix tree rebuilt. -/
+private def ModuleData.renameMain (owned : Std.HashSet Name) (new : Name) (data : ModuleData) :
+    ModuleData :=
+  let constNames := data.constNames.map (mainUnder owned new)
+  let constants := data.constants.map (·.renameMain owned new)
+  { data with
+    constNames, constants
+    constTrie? := data.constTrie?.map fun _ => .ofArrays constNames constants }
+
+/--
+Gives each `main` past the first, in module order, a name of its own, `<module>._shake_main`,
+together with the declarations the same module names under it (`main.match_1`), in the module
+declaring it and in every module importing that one, so that one environment holds several
+executables' roots. Names under `main` that another module declares keep their names. Intended for
+use in `shake` only: a module refers only to the `main` of its own import closure, and its
+references keep pointing at that module.
+-/
+def ImportState.renameMainsApart (self : ImportState) : ImportState := Id.run do
+  let owners := self.moduleNames.filter fun mod =>
+    (self.moduleNameMap[mod]?.bind (·.mainModule?)).any (·.constNames.contains `main)
+  let mut self := self
+  for owner in owners[1:] do
+    let new := owner ++ `_shake_main
+    let owned : Std.HashSet Name :=
+      ((self.moduleNameMap[owner]?.bind (·.mainModule?)).map (·.constNames)).getD #[]
+        |>.foldl (init := {}) fun o n => if (`main).isPrefixOf n then o.insert n else o
+    -- `moduleNames` lists each module after the modules it imports, so one pass finds every module
+    -- importing `owner`.
+    let mut importers : Std.HashSet Name := ({} : Std.HashSet Name).insert owner
+    for mod in self.moduleNames do
+      let imps := ((self.moduleNameMap[mod]?.bind (·.mainModule?)).map (·.imports)).getD #[]
+      if imps.any (importers.contains ·.module) then
+        importers := importers.insert mod
+    for mod in importers do
+      let some m := self.moduleNameMap[mod]? | continue
+      let m := { m with
+        parts := m.parts.map fun (d, r) => (d.renameMain owned new, r)
+        irParts := m.irParts.map fun (d, r) => (d.renameMain owned new, r) }
+      self := { self with moduleNameMap := self.moduleNameMap.insert mod m }
+  return self
+
+/--
 Checks for conflicting declarations of the same name across imported modules (private view only,
 which contains every name occurring in the public view). A pair of modules is exempt if one of the
 current import's direct imports loaded both modules' data, at least at the current import's levels,

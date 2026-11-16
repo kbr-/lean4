@@ -690,21 +690,47 @@ local instance : Ord Import where
     compareOn fun imp => (!imp.isExported, imp.module.toString)
 
 /--
-Run the shake analysis with the given arguments.
-
-Assumes Lean's search path has already been properly configured.
+Splits `roots` into groups that each load into one environment: greedily, in the given order, a
+root joins the first group whose modules, with the root's own, declare no name in a way
+`finalizeImport` refuses (`ImportState.Declarations.conflicts` on those modules alone, which can
+split roots that would load together, never the reverse). Returns each
+group's roots with the modules they import, and for each root starting a group past the first, a
+name that kept it out of the first group.
 -/
-public def run (args : Args) (srcSearchPath : SearchPath := {}) : IO UInt32 := do
+def groups (s : ImportState) (decls : ImportState.Declarations) (roots : Array Name) :
+    Array (Array Name × Std.HashSet Name) × Array (Name × Name) := Id.run do
+  let mut gs : Array (Array Name × Std.HashSet Name) := #[]
+  let mut splits := #[]
+  for root in roots do
+    let closure := s.importClosure root
+    let clashes (mods : Std.HashSet Name) : Array Name :=
+      decls.conflicts fun mod => mods.contains mod || closure.contains mod
+    match gs.findIdx? fun g => (clashes g.2).isEmpty with
+    | some i =>
+      let (rs, mods) := gs[i]!
+      gs := gs.set! i (rs.push root, closure.fold (·.insert ·) mods)
+    | none =>
+      if let some n := gs[0]?.bind fun g => (clashes g.2)[0]? then
+        splits := splits.push (root, n)
+      gs := gs.push (#[root], closure)
+  return (gs, splits)
 
-  -- the list of root modules
-  let mods := args.mods
-  -- Only submodules of `pkgs` will be edited or have info reported on them
-  let pkgs := mods.map (·.getRoot)
-
-  -- Load all the modules
+/--
+Runs the analysis on one group: `mods`, the group's roots, loaded from `s` into one environment.
+The modules in `done` were reported on by an earlier group; they are analysed again, silently, so
+that their edits reach the modules downstream of them here, but neither reported nor edited again.
+The first group (`first`) prints the `--fix` header, after its own checks. Returns the exit code,
+`done` with the modules reported on here, and with `--fix` each edited file's path and new
+contents; `run` prints each group's output and writes its files once every group has succeeded.
+-/
+def runGroup (args : Args) (srcSearchPath : SearchPath) (mods : Array Name) (s : ImportState)
+    (done : Std.HashSet Name) (first : Bool) :
+    IO (UInt32 × Std.HashSet Name × Array (System.FilePath × String)) := do
+  -- Only submodules of `pkgs` will be edited or have info reported on them. They are taken from
+  -- all of the call's roots, so that a module another group reports on is analysed here too and
+  -- its edits reach the modules downstream of it.
+  let pkgs := args.mods.map (·.getRoot)
   let imps := mods.map ({ module := · })
-  let (_, s) ← importModulesCore imps (isExported := true) |>.run
-  let s := s.markAllExported
   let mut env ← finalizeImport s (isModule := true) imps {} (leakEnv := true) (loadExts := false)
   if env.header.moduleData.any (!·.isModule) then
     throw <| .userError "`lake shake` only works with `module`s currently"
@@ -731,7 +757,7 @@ public def run (args : Args) (srcSearchPath : SearchPath := {}) : IO UInt32 := d
     else
       BaseIO.asTask (parseHeader srcSearchPath s.modNames[i]! |>.toBaseIO)
 
-  if args.fix then
+  if args.fix && first then
     println! "The following changes will be made automatically:"
 
   -- Check all selected modules
@@ -744,21 +770,32 @@ public def run (args : Args) (srcSearchPath : SearchPath := {}) : IO UInt32 := d
     -- Visit them first so that their import closures are final when we add the import to the
     -- remaining modules
     order := order.filter (noAddDownstream[·]!) ++ order.filter (!noAddDownstream[·]!)
+  let mut done := done
   for i in order do
     match headers[i]!.get with
     | .ok ⟨_, _, stx, _⟩ =>
-      visitModule pkgs srcSearchPath i needs[i]!.get stx args (addDownstream := !noAddDownstream[i]!)
+      let visit :=
+        visitModule pkgs srcSearchPath i needs[i]!.get stx args (addDownstream := !noAddDownstream[i]!)
+      if done.contains s.modNames[i]! then
+        let _ ← IO.FS.withIsolatedStreams (isolateStderr := true) visit
+      else
+        visit
     | .error e =>
-      println! e.toString
+      if !done.contains s.modNames[i]! then
+        println! e.toString
+  let edits := (← get).edits.filter fun mod _ => !done.contains mod
+  for i in order do
+    if pkgs.any (·.isPrefixOf s.modNames[i]!) then
+      done := done.insert s.modNames[i]!
 
   if !args.fix then
     -- return error if any issues were found
-    return if (← get).edits.isEmpty then 0 else 1
+    return (if edits.isEmpty then 0 else 1, done, #[])
 
-  -- Apply the edits to existing files
-  let mut count := 0
+  -- Compute the edited files' contents
+  let mut writes := #[]
   for mod in s.modNames, header? in headers do
-    let some (remove, add) := (← get).edits[mod]? | continue
+    let some (remove, add) := edits[mod]? | continue
     let add : Array Import := add.qsortOrd
 
     -- Parse the input file
@@ -785,13 +822,68 @@ public def run (args : Args) (srcSearchPath : SearchPath := {}) : IO UInt32 := d
         out := out ++ s!"{mod}\n"
     out := out ++ text.extract insertion text.endPos
 
-    IO.FS.writeFile path out
-    count := count + 1
+    writes := writes.push (path, out)
+  return (0, done, writes)
 
-  -- Since we throw an error upon encountering issues, we can be sure that everything worked
-  -- if we reach this point of the script.
-  if count > 0 then
-    println! "Successfully applied {count} suggestions."
-  else
-    println! "No edits required."
-  return 0
+/--
+Run the shake analysis with the given arguments. The roots' modules are loaded once; each
+executable's `main` past the first, with the declarations its module names under it, is renamed
+apart, and when the roots' modules together still declare a name in conflicting ways, the roots are
+analysed in groups whose modules each load together.
+
+Assumes Lean's search path has already been properly configured.
+-/
+public def run (args : Args) (srcSearchPath : SearchPath := {}) : IO UInt32 := do
+  -- Load all the modules
+  let imps := args.mods.map ({ module := · })
+  let (_, s) ← importModulesCore imps (isExported := true) |>.run
+  let s := s.markAllExported
+  -- One root's modules were compiled together, so they declare `main` once and no name in
+  -- conflicting ways. With more, the conflicts are found after the renaming, which can make two
+  -- declarations about different modules' `main` differ, and the roots are split only when all
+  -- of their modules together don't load.
+  let all : Std.HashSet Name :=
+    args.mods.foldl (init := {}) fun all root => (s.importClosure root).fold (·.insert ·) all
+  let (s, gs, splits) :=
+    if args.mods.size ≤ 1 then (s, #[(args.mods, all)], #[]) else
+      let s := s.renameMainsApart
+      let decls := s.declarations
+      if (decls.conflicts fun _ => true).isEmpty then
+        (s, #[(args.mods, all)], #[])
+      else
+        let (gs, splits) := groups s decls args.mods
+        (s, gs, splits)
+  if gs.size > 1 then
+    if let some imp := args.addDownstream? then
+      -- Each group would decide the downstream import against its own modules alone.
+      let names := ", ".intercalate ((splits.toList.map (·.2)).eraseDups.map fun n => s!"`{n}`")
+      throw <| .userError s!"cannot add `{imp.module}` downstream across roots that are checked \
+        apart (declaring {names} differently); run shake on each group's roots"
+  for (root, n) in splits do
+    IO.eprintln s!"shake: `{root}` is checked apart, as `{n}` is declared differently elsewhere"
+  let mut code : UInt32 := 0
+  let mut done := {}
+  let mut writes := #[]
+  let mut outs := #[]
+  for (roots, mods) in gs, i in [0:gs.size] do
+    let group := runGroup args srcSearchPath roots (s.restrict mods) done (first := i == 0)
+    -- One group prints as it runs; with more, a later group's refusal must find nothing printed.
+    let (out, c, d, w) ← if gs.size == 1 then (("", ·)) <$> group else
+      IO.FS.withIsolatedStreams (isolateStderr := false) group
+    outs := outs.push out
+    code := max code c
+    done := d
+    writes := writes ++ w
+  -- Since we throw an error upon encountering issues, we can be sure that every group succeeded
+  -- if we reach this point of the script, so the suggestions are printed and the files written
+  -- all or none.
+  for out in outs do
+    IO.print out
+  if args.fix then
+    for (path, out) in writes do
+      IO.FS.writeFile path out
+    if writes.size > 0 then
+      println! "Successfully applied {writes.size} suggestions."
+    else
+      println! "No edits required."
+  return code

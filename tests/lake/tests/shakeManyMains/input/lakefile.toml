@@ -1,0 +1,27 @@
+name = "test"
+version = "0.1.0"
+defaultTargets = ["a", "b", "c", "d", "e"]
+
+[[lean_lib]]
+name = "Lib"
+globs = ["Lib.**"]
+
+[[lean_exe]]
+name = "a"
+root = "A"
+
+[[lean_exe]]
+name = "b"
+root = "B"
+
+[[lean_exe]]
+name = "c"
+root = "C"
+
+[[lean_exe]]
+name = "d"
+root = "D"
+
+[[lean_exe]]
+name = "e"
+root = "E"
